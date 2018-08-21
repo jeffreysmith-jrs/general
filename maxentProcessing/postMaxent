@@ -1,970 +1,232 @@
-#Import librarires
-import os
+#Reads in a Maxent summary file and generates the SDM graph (working-ish)
+#Jeffrey Smith
+#August 21,2018
+
+#Import libraries
+import os, codecs
 import numpy as np
 import pandas as pd
-import geopandas as gpd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from geopandas.geoseries import *
-from shapely.geometry import *
 from glob import glob
-import pymc3 as pm
-import theano
-import theano.tensor as tt
-import psycopg2
-import rasterio, rasterio.features
-from astropy.convolution import convolve
-from astropy.convolution.kernels import Gaussian2DKernel
-from matplotlib.gridspec import GridSpec
-from itertools import combinations
-import tempSave as ts
-import math
-import postMaxent
-import rasterstats
-from rasterio.plot import show
-from rasterio.mask import mask
-import json
-
-#Set you data directory where data is stored unles otherwise indicated
-dataDir			=	'C:\\Users\\Jeffrey\\Documents\\Academic\\Stanford\\Birds\\2018\\Data\\'
+from math import exp
 
 
-#Read in Costa Rica shapefile
-costaRica		=	gpd.read_file('E:\\GIS_Layers\\CR_birds\\CR.shp')
-costaRica.crs 	= 	{'init': 'epsg:4326'}
-
-#Read in bird shapefiles
-birdShapeFiles 		= 	gpd.read_file('E:\\GIS_Layers\\BOTW.gdb\\BOTW.gdb', layer='All_Spp', 
-						bbox = tuple(costaRica.total_bounds))	
-birdShapeFiles.crs	=	{'init': 'epsg:4326'}
-
-
-
-
-#Spatial data
-def getFeatures(gdf):
-    return [json.loads(gdf.to_json())['features'][0]['geometry']]
-
-
-#Set directory with ASCIIs for SDM
-envDirectory	=	'E:\\GIS_Layers\\CR_birds\\Tiffs\\'
-climateLayers			=	glob(str(envDirectory + '*tif'))
-
-
-#Read all of your predictor variables for the SDM into a dictionary
-predictors		=	{}
-for i in range(len(climateLayers)):
-
-	#Open up your first raster file
-	predictorR 	= 	rasterio.open(climateLayers[i])
+def postMaxent(outputDirectory, species):
+	if isinstance(species, basestring):
+		species	=	[species]
 	
-	#Read it in as a numpy array
-	predictor	=	predictorR.read(1).astype(np.float64)
-	
-	#Get your data our regarding cell size, etc.
-	affine		=	predictorR.affine
-	
-	#Get rid of your no data values
-	predictor[predictor == predictorR.nodata] = np.nan
-	
-	#Normalize your predictor
-	predictor	=	(predictor - np.nanmin(predictor))/ (np.nanmax(predictor)-np.nanmin(predictor))
-	
-	#Name your predictor and set it to a dictionary
-	predictorName				=	climateLayers[i].split('\\')[-1].split('.')[0]
-	predictors[predictorName]	=	np.copy(predictor)
-	
-	
-#Make mask of NoData values in rasters
-predictorMask	=	np.copy(predictors[predictorName]) * 0
-
-#Read in GBIF point data
-GBIF				=	pd.read_csv('E:\\GIS_Layers\\CR_birds\\test.csv')
-GBIF['geometry'] 	= 	[Point(xy) for xy in zip(GBIF.decimallongitude, GBIF.decimallatitude)]	
-GBIF.crs = {'init': 'epsg:4326'}
+	for t in range(len(species)):
+		species	=	str(species[t])
 
 
-#Only keep GBIF records within Costa Rica
-GBIF			=	gpd.sjoin(GBIF, costaRica, op = 'within').reset_index(drop = True)
-GBIF			=	GBIF[['species', 'decimallatitude', 'decimallongitude', 'geometry']]
-	
-#Asign GBIF points to the pixel they belong to rather than their lat/long
-GBIF['xpix']	=	((GBIF['decimallongitude'] - affine[2]) / affine[0]).astype(int)
-GBIF['ypix']	=	(((GBIF['decimallatitude']	 - affine[5]) / affine[4])).astype(int)
-	
+		#Read in maxent HTML
+		htmlFile		=	codecs.open(str(outputDirectory + species + '.html'), 'r')
+		maxentHTML		=	 htmlFile.read()
+		htmlFile.close()
+
+		#Get the variables used in the Maxent Run
+		batchLineCommand	=	maxentHTML.split('\n')[-2]
+		batchLineCommand	=	batchLineCommand.replace('<br>', ' ') #End on a space
 
 
+		#Figure out where in the string things start and extract relevant information
+		startSamples 		=	batchLineCommand.find('samplesfile') + 12
+		endSamples			=	batchLineCommand[startSamples:].find(' ') + startSamples
+		samplesFile			=	batchLineCommand[startSamples:endSamples]
 
+		#Get environmental layers used to make the maxent model
+		startEnv			=	batchLineCommand.find('environmentallayers') + 20 
+		endEnv				=	batchLineCommand[startEnv:].find(' ') + startEnv
+		inputAsciis			=	batchLineCommand[startEnv:endEnv]
 
-#Read in landcover maps
-landcoverDirectory		=	'E:\\GIS_Layers\\CR_birds\\Tiffs\\'
-#landcoverLayers			=	glob(str(envDirectory + '*tif'))
-
-#Make a list of all your layers
-landcoverLayers	=	['E:\\GIS_Layers\\NDVI_EVI\\EVI_1984.tif', 'E:\\GIS_Layers\\NDVI_EVI\\NDVI_1984.tif']
-allLayers		=	climateLayers + landcoverLayers
-
-
-
-#Read in zook transects
-zookTransects		=		gpd.read_file(dataDir + 'zook_transects.shp')
-zookTransects.crs 	= 		{'init': 'epsg:32617'}
-zookTransects		=		zookTransects.reset_index()
-
-
-#Buffer our your transects
-bufferDistances		=	[150, 1500]
-
-#Loop through the distances you want to buffer out to
-for i in range(len(bufferDistances)):
-	
-	#Loop through your layers
-	for j in range(len(allLayers)):
+		#Deal with replicated runs
+		startReplicates		=	batchLineCommand.find('replicates') + 11 
+		if startReplicates != 10:
 		
-		#Read in your layer
-		LCmap	 	= 	rasterio.open(allLayers[j])
-		
-		#Get the dimensions of your layer
-		affine 		= 	LCmap.affine
-	
-		#Set your layer as a np array
-		LULC			=	LCmap.read(1).astype(np.float64)
-		
-		#Normalize landcover maps
-		LULC			=	(LULC - np.nanmin(LULC))/ (np.nanmax(LULC)-np.nanmin(LULC))
-		
-		#Set no data to no data
-		LULC[LULC == LCmap.nodata] = np.nan
+			#This became an issue if replicates was the last thing listed in the command line
+			#So I had to add to search for either the next space or the line break
+			endReplicates		=	batchLineCommand[startReplicates:].find(' ')
+			if endReplicates > 0:
+				endReplicates	=	endReplicates + startReplicates
+			else:
+				endReplicates		=	batchLineCommand[startReplicates:].find(' ') + startReplicates
+
+
 			
-		#Name the output variable
-		name		=	str(str(allLayers[j]).split('\\')[-1].split('.')[0] + '_' + str(bufferDistances[i]) + 'm')
+			replicates			=	int(batchLineCommand[startReplicates:endReplicates])
 		
-		#Buffer your transects out to the dimensions you need
-		zookTransectsBuffer		=		zookTransects.buffer(bufferDistances[i])	
-		zookTransectsBuffer		=		zookTransectsBuffer.to_crs({'init': 'epsg:4326'})
-		
-		#Try to do zonal statistics if your areas are bigger than pixel grain
-		if np.min(zookTransectsBuffer.area)	>=	affine[0] ** 2:
-			
-			#Do zonal statistics or something dumb like that
-			outStats	=	rasterstats.zonal_stats(zookTransectsBuffer, LULC, affine=affine, stats=['mean'])
-			outStatsDF	=	pd.DataFrame(outStats).reset_index()
-			
-			#Add your statistics to the initial transect
-			outStatsDF	=	outStatsDF.rename(columns = {'mean':name})
-			zookTransects	=	pd.merge(zookTransects, outStatsDF, left_on = 'index', right_on = 'index')
-		
-		#If your polygons would be smaller than your resolution just take the value at the centroid
+		#Unreplicated runs
 		else:
-			#Calculate the centroid of your lines
-			zookTransectsCentroid	=		zookTransects.centroid
-			zookTransectsCentroid	=		zookTransectsCentroid.to_crs({'init': 'epsg:4326'})
-			
-			#Get the latitutde and longitude
-			x	=	zookTransectsCentroid.apply(lambda p: p.x).values
-			y	=	zookTransectsCentroid.apply(lambda p: p.y).values
-			
-			#Get the xpixel and ypixel of your centroid
-			xpix	=	((x - affine[2]) / affine[0]).astype(int)
-			ypix	=	(((y	 - affine[5]) / affine[4])).astype(int)
-			
-			#Find and save the value of your centroid
-			outStatsDF		=	pd.DataFrame(LULC[ypix, xpix], columns = [name]).reset_index()
-			zookTransects	=	pd.merge(zookTransects, outStatsDF, left_on = 'index', right_on = 'index')
-		
-		
-		
-		
-#Read in Zook data
-zookDataO		=	pd.read_csv(str(dataDir + 'JZ_Data_1999_2014.csv'))
+			replicates = 1
 
+		#Figure out which, if any asciis were excluded from analysis
+		toExclude			=	batchLineCommand
+		excludedLayers		=	[]
+		while toExclude.find('-N') > 0:
+			startExclude	=	toExclude.find('-N') + 3 
+			endExclude		=	toExclude[startExclude:].find(' ') + startExclude
+			excludeLayer	=	toExclude[startExclude:endExclude]
+			toExclude		=	toExclude[endExclude:]
+			excludedLayers	=	excludedLayers + [excludeLayer]
+
+		#Read in dataframes	
+		#Make blank dictionary to hold them all
+		predictors				=	{}
+		environmentalLayers		=	glob(str(inputAsciis + '\\*.asc'))
+		for i in range(len(environmentalLayers)):
+			asciiName	=	environmentalLayers[i].split('\\')[-1].split('.')[0]
+			
+			#Make sure those asciis were not excludled from the analysis
+			if asciiName not in excludedLayers:
+				predictors[asciiName]	=	np.genfromtxt(environmentalLayers[i], skip_header = 6)
+				predictors[asciiName][predictors[asciiName] == -9999] = np.nan
+
+				
+
+		replicatedRuns	=	np.zeros(shape = (replicates, len(predictors[asciiName]), len(predictors[asciiName][0])))
+		for k in range(replicates):
 					
-#Get a list of all the species Jim has seen					
-zookSpecies		=	pd.unique(zookDataO['Species'])
-
-
-#Set parameters for which species you want to analyze
-numberObs		=	25
-toKeep	=	[]
-for i in range(len(zookSpecies)):
-
-	temp	=	zookDataO[zookDataO['Species'] == zookSpecies[i]]
-	temp	=	temp.reset_index()
-	
-	if np.sum(temp['Number']) >= numberObs:
-		toKeep	=	toKeep + [temp['Species'][0]]
-
-
-zookDataO	=	zookDataO[zookDataO['Species'].isin(toKeep)]		
-
-#Subset based on number of observations
-seasons		=	zookDataO.Season.unique()
-numSeasons	=	len(seasons)
-sitesPerYear	=	3
-for i in range(numSeasons):
-	
-	
-	#Subset based on season
-	zookData		=	zookDataO[(zookDataO['Season'] == seasons[i])]
-
-
-	#Unique transect code
-	zookData['uniqueTrans']		=	zookData['Land type'].map(str) + '-' + zookData['Location'].map(str) + '-' + zookData['Transect'].map(str)
-
-
-
-	#Subset by region
-	GUa				=	zookData[(zookData['Location'] == 'GU')]
-	SIa				=	zookData[(zookData['Location'] == 'SI')]
-	PVa				=	zookData[(zookData['Location'] == 'PV')]
-	LCa				=	zookData[(zookData['Location'] == 'LC')]
-
-	#Drop extra columns
-	GUa				=	GUa.drop(['Land type', 'Location', 'Transect', 'Date', 'Year'], axis=1)
-	SIa				=	SIa.drop(['Land type', 'Location', 'Transect', 'Date', 'Year'], axis=1)
-	PVa				=	PVa.drop(['Land type', 'Location', 'Transect', 'Date', 'Year'], axis=1)
-	LCa				=	LCa.drop(['Land type', 'Location', 'Transect', 'Date', 'Year'], axis=1)
-
-
-	#Add 0s to Zook dataset
-	GU				=	GUa.pivot_table(index='Species', columns=['Season', 'uniqueTrans'], values='Number', aggfunc = 'max')
-	GU				=	GU[GU.sum(axis=1) >= sitesPerYear].fillna(0).unstack().reset_index(name='Count')
-
-	SI				=	SIa.pivot_table(index='Species', columns=['Season', 'uniqueTrans'], values='Number', aggfunc = 'max')
-	SI				=	SI[SI.sum(axis=1) >= sitesPerYear].fillna(0).unstack().reset_index(name='Count')
-
-	PV				=	PVa.pivot_table(index='Species', columns=['Season', 'uniqueTrans'], values='Number', aggfunc = 'max')
-	PV				=	PV[PV.sum(axis=1) >= sitesPerYear].fillna(0).unstack().reset_index(name='Count')
-
-	LC				=	LCa.pivot_table(index='Species', columns=['Season', 'uniqueTrans'], values='Number', aggfunc = 'max')
-	LC				=	LC[LC.sum(axis=1) >= sitesPerYear].fillna(0).unstack().reset_index(name='Count')
-
-	#Re-aggregate zookData
-	zookData		=	GU.append(SI, ignore_index = True).append(PV, ignore_index = True).append(LC, ignore_index = True)
-	
-	if i == 0:
-		zookDataF	=	zookData.copy()
-	else:
-		zookDataF	=	zookDataF.append(zookData)
-
-#Reset index
-zookDataF	=	zookDataF.reset_index()
-
-#Read in name match files
-nameMatch		=	pd.read_csv(str(dataDir + 'name_match.csv'))
-
-
-#Match Jim's name with known names
-zookDataF		=	pd.merge(left= zookDataF, right = nameMatch, 
-					left_on = 'Species', right_on = 'Jim', how = 'left').reset_index(drop = True)
-
-
-		
-
-
-#Read in trait data						
-jetzTraits		=	pd.read_csv(str(dataDir + 'Jetz_Elton_Traits.csv'))
-bioElev			=	pd.read_csv(str(dataDir + 'bio_elev.csv'))
-ranges			=	pd.read_csv(str(dataDir + 'range.csv'))
-redList			=	pd.read_csv(str(dataDir + 'redList.csv'))
-dailyTraits		=	pd.read_csv(str(dataDir + 'dailyTraits.csv'))
-
-#Merge trait data
-traits			=	pd.merge(nameMatch, jetzTraits, left_on = ['Genus (jetz)','Spp (jetz)'], right_on = ['Genus','species'], how='left')
-traits			=	pd.merge(traits, bioElev, left_on = ['ClimateSciName'], right_on = ['binom'], how='left')
-traits			=	pd.merge(traits, redList, left_on = ['SciName'], right_on = ['Scientific name'], how='left')
-traits			=	pd.merge(traits, ranges, left_on = ['SciName'], right_on = ['SCINAME'], how='left')
-traits			=	pd.merge(traits, dailyTraits, left_on = ['Jim'], right_on = ['species_code'], how='left')
-#Come back later and check for synonym names here
-		
-
-#Add forest cover
-zookDataF		=	pd.merge(zookDataF, zookTransects, left_on = ['uniqueTrans'], right_on = ['TRANSECT'], how='left')
-
-#Add traits
-full			=	pd.merge(zookDataF, traits, left_on = 'Species', right_on = 'JimNames', how = 'left')
-
-#Get list of scientific names to use
-zookSpecies		=	pd.unique(full['SciName_x'])
+			#Make blank basemap
+			fx	=	np.zeros_like(predictors[asciiName]) * predictors[asciiName]
+			fx	=	fx.astype(np.float64)
 					
+			#Read in lambdas file from maxent
+			
+			if replicates > 1:
+				fname		=	str(outputDirectory + species + '_' + str(k) + '.lambdas')
+			else:
+				fname		=	str(outputDirectory + species +  '.lambdas')
+			lambdas		=	pd.read_csv(fname, names = ['variable', 'lambda', 'min', 'max'], dtype = {'varaible':str})		
+			
+			#Extract constants
+			linearPredictorNormalizer	=	float(lambdas.loc[lambdas['variable'] == 'linearPredictorNormalizer']['lambda'])
+			densityNormalizer			=	float(lambdas.loc[lambdas['variable'] == 'densityNormalizer']['lambda'])
+			numBackgroundPoints			=	float(lambdas.loc[lambdas['variable'] == 'numBackgroundPoints']['lambda'])
+			entropy						=	float(lambdas.loc[lambdas['variable'] == 'entropy']['lambda'])
 
-#Loop through species
-speciesNumber	=	0
-for speciesNumber in range(1):
-	#Read in maxent results
-	maxentResults 	= 	postMaxent.postMaxent('E:\\GIS_Layers\\CR_birds\\Outputs\\', zookSpecies[speciesNumber].replace(" ", "_"))
-	maxentAverage	=	np.nanmean(maxentResults, axis = 0)
-
-
-	#Set up shapefile
-	birdShapeFile	=	birdShapeFiles[birdShapeFiles['SCINAME'] == zookSpecies[speciesNumber]][['SCINAME', 'geometry']]
-	birdShapeFile	=	gpd.overlay(birdShapeFile, costaRica, how = 'intersection')
-	birdShapeFile.crs	=	{'init': 'epsg:4326'}
-	
-	#Make range map into a mask
-	rangemap 		= 	rasterio.features.rasterize(shapes=birdShapeFile['geometry'],out_shape=predictorR.shape, transform=predictorR.transform)
-	rangemap		=	rangemap.astype('float')
-	
-	#Get the points you're going to use
-	selectedPointsO		=	GBIF[GBIF['species'] == zookSpecies[speciesNumber]]
-	selectedPointsO.crs	=	{'init': 'epsg:4326'}
-	
-
-	#Set number of pseudo-absences
-	numberPseduoAbsences	=	1000
-	fractionTrainingPoints	=	0.8
-	
-	#Figure out how many fall inside the range map
-	innerPoints			=	gpd.sjoin(selectedPointsO, birdShapeFile, how="inner", op='intersects')
-	ratioInside			=	float(len(innerPoints)) / float(len(selectedPointsO))
-
-	#Place holder - set probability of being in/out of range map
-	rangemap[rangemap == 1] = ratioInside
-	rangemap[rangemap == 0] = 1 - ratioInside
-	rangemap	=	convolve(rangemap, Gaussian2DKernel(stddev=2))
-	rangemap	=	np.add(rangemap, predictorMask)
-	
-	#Select the pixels of your species
-	allPoints		=	selectedPointsO[['xpix', 'ypix']]
-	
-	#Set them to be true presences
-	allPoints['presence'] 	=	1
-	
-
-	
-	#Generate pseudo-absences
-	pseudoAbsences	=	np.append(	[np.random.uniform(0, predictorR.width, size = numberPseduoAbsences * 10).astype(int)],
-									[np.random.uniform(0, predictorR.height, size = numberPseduoAbsences * 10).astype(int)], axis = 0).transpose()
-	pseudoAbsences	=	pd.DataFrame(pseudoAbsences, columns = ['xpix', 'ypix'])
-	pseudoAbsences.drop_duplicates(inplace = True)
-	
-	#Extract values from predictor layers
-	for key, value in predictors.iteritems():
-		allPoints[key]		= 	value[allPoints['ypix'], allPoints['xpix']]
-		pseudoAbsences[key]		=	value[pseudoAbsences['ypix'], pseudoAbsences['xpix']]
-	
-	allPoints['rangemap']	= 	rangemap[allPoints['ypix'], allPoints['xpix']]
-	pseudoAbsences['rangemap']	= 	rangemap[pseudoAbsences['ypix'], pseudoAbsences['xpix']]
-	
-	
-	
-	#Remove duplicates
-	allPoints.drop_duplicates(inplace = True)
-	allPoints.dropna(axis = 0, how = 'any', inplace = True)
-	
-	#Split into test and training
-	trainingPoints	=	allPoints.sample(frac=fractionTrainingPoints)
-	testPoints		=	allPoints[~allPoints.index.isin(trainingPoints.index)]
-	
-	
-
-
-	#Drop pseudo-absences not on map
-	pseudoAbsences.dropna(axis = 0, how = 'any', inplace = True)
-	
-	
-	
-	#Remove psuedo-absences that overlap with presence locations????
-	pseudoAbsences["key"] = pseudoAbsences["xpix"].map(str) + '_' + pseudoAbsences["ypix"].map(str)
-	trainingPoints["key"] = trainingPoints["xpix"].map(str) + '_' +  trainingPoints["ypix"].map(str)
-	pseudoAbsences[~pseudoAbsences.key.isin(trainingPoints.key)]
-	
-	#Select 1000 pseudo-absences
-	pseudoAbsences.reset_index(drop = True, inplace = True)
-	pseudoAbsences['presence']	=	0
-	testAbsences	=	pseudoAbsences.tail(len(testPoints))
-	pseudoAbsences	=	pseudoAbsences.head(numberPseduoAbsences)
-	
-	
+			#Drop rows with constants
+			lambdas = 	lambdas[:-4]
 		
-	#Up weight presence points to equal number of pseudo-absences
-	trainingPoints		=	pd.concat([trainingPoints] * ((numberPseduoAbsences/len(trainingPoints) + 1)))
-	trainingPoints		=	trainingPoints.head(numberPseduoAbsences)
-	
-	
-	
-	
-	#Combine presences and pseudo-absences
-	trainingPoints	=	trainingPoints.append(pseudoAbsences).reset_index(drop = True)
-	testPoints		=	testPoints.append(testAbsences).reset_index(drop = True)
-	
-
-
-	
-
-	#Do sdm
-	niter 	= 	2500
-	burnin 	= 	500
-	def tinvlogit(x):
-		return tt.exp(x) / (1 + tt.exp(x))
-
-	
-	#Do model with just climate
-	with pm.Model() as climateModel:
-	
-		#Prior for constant
-		c_beta0	=	pm.Flat('c_beta0')
 		
-		#Set up list with all of your coefficients
-		betaNames	=	['c_beta0']
 		
-		#Priors for linear and quadratic predictors
-		for j in range(len(predictors)):
+			#Check for catagorical features:
+			catagoricalFeatures	=	lambdas[lambdas['variable'].str.contains('\=')]
+			lambdas.drop(catagoricalFeatures.index, inplace = True)
+			catagoricalFeatures	=	catagoricalFeatures.reset_index(drop = True)
 			
-			#Set variables names
-			name	=	list(predictors)[j]
-			l_name	=	str('l_' + name)
-			s_name	=	str('s_' + name)
-						
-			#Add names to list of predictors
-			betaNames			=	betaNames + [l_name, s_name]
 			
-			#Set priors
-			globals()[l_name] 	= 	pm.Normal(l_name, 0, 25)
-			globals()[s_name] 	= 	pm.Normal(s_name, 0, 25)
 
-			
-		#Do multiplicative features
-		multiplicative	=	["qqq".join(map(str, comb)) for comb in combinations(list(predictors), 2)]
-		for j in range(len(multiplicative)):
-			
-			#Come up with names
-			name	=	multiplicative[j]
-			p_name	=	str('p_' + name)
-			
-			#Add names to list of predictors
-			betaNames			=	betaNames + [p_name]
-			
-			#Set prior
-			globals()[p_name] 	= 	pm.Normal(p_name, 0, 25)
-
-		#Create the model
-		for j in range(len(betaNames)):
-			variable		=	betaNames[j]
-			form, feature	=	variable.split('_')
-			
-			#Process constants
-			if form == 'c':
-				logitpStr	= str(variable)
-			
-			#Process linear features
-			if form == 'l':
-				logitpStr	=	str(logitpStr + '+' + variable + '*' + 'trainingPoints["' + feature + '"]')
+			if len(catagoricalFeatures) >= 1:
+				for i in range(len(catagoricalFeatures)):
+					layer, cutoff		=	catagoricalFeatures['variable'][i].strip('/(').strip('/)').split('=')
+					x					=	predictors[layer]
+					
+					category	=	np.where(x == float(cutoff), catagoricalFeatures['lambda'][i], 0)
+					fx 	+= 	category
 				
-			#Process quadratic features
-			elif form == 's':
-				logitpStr	=	str(logitpStr + '+' + variable + '*' + 'trainingPoints["' + feature + '"]**2')
 				
-			#Process product features
-			elif form == 'p':
-				feature1, feature2 = feature.split('qqq')
-				logitpStr	=	str(logitpStr + '+' + variable + '*' + 'trainingPoints["' + feature1 + '"]*trainingPoints["' + feature2 +'"]')
 				
+			#Check for threshold features:
+			thresholdFeatures	=	lambdas[lambdas['variable'].str.contains('\<')]
+			lambdas.drop(thresholdFeatures.index, inplace = True)
+			thresholdFeatures	=	thresholdFeatures.reset_index(drop = True)
 			
-		#Finalize the model and apply logit tranform
-		logitp	=  eval(logitpStr) 
-		p_climate 	= 	pm.Deterministic('p_climate', tinvlogit(logitp))
-		
-		#Test with data
-		y	=	pm.Binomial('y', p = p_climate,  n = 1, observed = trainingPoints['presence'])
-	
-	
-	#Run climate model
-	with climateModel:
-		trace 	=	 pm.sample(niter, progressbar = True, target_accept = 0.7)
-		
-		#Set up a DF to hold your posteriors
-		posterior	=	pd.DataFrame(index = np.arange(niter-burnin))
 			
-		#Get your posteriors out
-		for j in range(len(betaNames)):
-			name	=	betaNames[j]
-			posterior[name]	=	trace.get_values(str(name), burn=burnin)
 
-		#Map out the cliamte only predictions
-		climateSDM	=	np.zeros_like(predictorMask)		
-		climateSDM	=	climateSDM * predictorMask
-		
-		#Loop through features
-		for j in range(len(betaNames)):
-			variable		=	betaNames[j]
-			form, feature	=	variable.split('_')
-		
-			#Process constants
-			if form == 'c':
-				climateSDM	=	climateSDM + np.mean(posterior[variable])
+			if len(thresholdFeatures) >= 1:
+				for i in range(len(thresholdFeatures)):
+					cutoff, layer		=	thresholdFeatures['variable'][i].strip('/(').strip('/)').split('<')
+					x					=	predictors[layer]
+					
+					
+					threshold	=	np.where(x < float(cutoff), 0, thresholdFeatures['lambda'][i])
+					fx 	+= 	threshold
 			
-			#Process linear features
-			if form == 'l':
-				climateSDM	=	climateSDM + np.mean(posterior[variable]) * predictors[feature]
-				
-			#Proces quadratic features
-			elif form == 's':
-				climateSDM	=	climateSDM + np.mean(posterior[variable]) * predictors[feature] ** 2
-				
-			#Process product features
-			elif form == 'p':
-				feature1, feature2	=	feature.split('qqq')
-				climateSDM	=	climateSDM + np.mean(posterior[variable]) * predictors[feature1] * predictors[feature2]
-				
-		
-		#Transform to probability of occurence
-		climateSDM 	= 	np.exp(climateSDM) / (1 + np.exp(climateSDM))
-		
-		#Pull out the expected values for occurences and pseudo-absneces 
-		trainingPoints['p_climate']	=	climateSDM[trainingPoints['ypix'], trainingPoints['xpix']]
-		testPoints['p_climate']	=	climateSDM[testPoints['ypix'], testPoints['xpix']]
-		
-	
-	
-	#Make model with just rangemap
-	with pm.Model() as rangeModel:			
-		fidelity	=	pm.Uniform('fidelity', 0, 1)
-		p_range		=	fidelity * trainingPoints['rangemap']
-		
-		y	=	pm.Binomial('y', p = p_range,  n = 1, observed = trainingPoints['presence'])
-	
-	#Evaluate mdoel with just range map
-	with rangeModel:
-		trace = pm.sample(niter, progressbar = True, target_accept = 0.7)
-	
-		#Extract rangemap 'fidelity' values
-		posterior['fidelity']	=	trace.get_values('fidelity', burn=burnin)
-
-		#Make SDM using just rangemap
-		rangeSDM	=	rangemap * np.mean(posterior['fidelity'])
-		
-		#Pull out p-values from your ranngemap 'sdm'
-		trainingPoints['p_range']	=	rangeSDM[trainingPoints['ypix'], trainingPoints['xpix']]
-		testPoints['p_range']		=	rangeSDM[testPoints['ypix'], testPoints['xpix']]
-	
-	#Combine the two models
-	with pm.Model() as fullModel:
-		rangemapConstant	=	pm.Uniform('rangemapConstant', 0, 1)
-		p_full				=	(rangemapConstant * trainingPoints['p_range']) + ((1 - rangemapConstant) * trainingPoints['p_climate'])
-		y	=	pm.Binomial('y', p = p_full,  n = 1, observed = trainingPoints['presence'])
-		
-	#Evaluate your 2 models
-	with fullModel:
-		trace = pm.sample(niter, progressbar = True, target_accept = 0.9)
-
-		#Get posterior for weighing of rangemap and climate map
-		posterior['rangemapConstant']	=	trace.get_values('rangemapConstant', burn=burnin)
-		
-		#Make full SDM
-		fullSDM		=	rangeSDM * np.mean(posterior['rangemapConstant']) + climateSDM * (1 - np.mean(posterior['rangemapConstant']))
-		
-		#Pull out p values for your points
-		trainingPoints['p']	=	fullSDM[trainingPoints['ypix'], trainingPoints['xpix']]
-		testPoints['p']		=	fullSDM[testPoints['ypix'], testPoints['xpix']]
-
-	#Add Maxent results
-	trainingPoints['p_maxent']	=	maxentAverage[trainingPoints['ypix'], trainingPoints['xpix']]
-	testPoints['p_maxent']		=	maxentAverage[testPoints['ypix'], testPoints['xpix']]
-
-	
-	
-	
-	#Look at your trace plots
-	fig0a 	= 	plt.figure()
-	
-	#Set up your plotting grid
-	numSubplots	=	len(list(posterior))
-	columns		=	int(math.ceil(numSubplots**0.5))
-	rows			=	int(math.ceil(numSubplots/columns))
-	if rows * columns != numSubplots:
-		rows += 1
-	gs			=	GridSpec(columns, rows)
-	
-	#Loop through the subplots
-	x = 0
-	y = 0
-	for j in range(numSubplots):
-		ax	=	fig0a.add_subplot(gs[x,y])
-		
-		#Add the trace
-		plt.plot(posterior[[j]])
-		
-		#Name the plot
-		plt.title(list(posterior)[j])
-		
-		#Bump up counters
-		x += 1
-		if x == columns:
-			x = 0
-			y += 1
 			
-	#Temp save and show
-	ts.tempSave(format = 'png')
-	plt.show()
-	
-
-	#Look at histograms of your parameters
-	fig0b 	= 	plt.figure()
-	
-	#Loop through the subplots
-	x = 0
-	y = 0
-	for j in range(numSubplots):
-		ax	=	fig0b.add_subplot(gs[x,y])
-		
-		#Add the distribution of your parameter estimates 
-		sns.distplot(posterior[[j]])
-		
-		#Name the plot
-		plt.title(list(posterior)[j])
-		
-		#Bump up counters
-		x += 1
-		if x == columns:
-			x = 0
-			y += 1
-	
-	#Temp save
-	ts.tempSave(format = 'png')
-	
-	#Show plot
-	plt.show()
-		
-	
-	
-	
-	#Look at relationshisp between predictor variable and p_occ
-	fig0c 	= 	plt.figure()
-
-	#Set up the plotting grid
-	numSubplots	=	len(list(predictors))
-	columns		=	int(math.ceil(numSubplots**0.5))
-	rows			=	int(math.ceil(numSubplots/columns))
-	if rows * columns != numSubplots:
-		rows += 1
-	gs			=	GridSpec(columns, rows)
-
-	#Loop through sub-plots
-	x = 0
-	y = 0
-	for j in range(numSubplots):
-		ax	=	fig0c.add_subplot(gs[x,y])
-		
-		#Add scatter plot between predictor variables and p-values
-		sns.regplot(trainingPoints[list(predictors)[j]], trainingPoints['p'], order = 3)
-		
-		#Bump up counters
-		x += 1
-		if x == columns:
-			x = 0
-			y += 1
-	
-	#Temp save
-	ts.tempSave(format = 'png')
-	
-	#show plot
-	plt.show()
-		
-
-	
-	#Visualize your species distriubtion	
-	fig1 	= 	plt.figure()
-	gs 	=	GridSpec(2,3)
-		
-	#Raw points and rangemap
-	ax1		=	fig1.add_subplot(gs[0,0])
-	ax1.set_aspect('equal')
-	costaRica.plot(ax = ax1,color = 'white', edgecolor = 'black')
-	birdShapeFile.plot(ax = ax1, alpha = 0.5)
-	ax1.scatter(selectedPointsO['decimallongitude'], selectedPointsO['decimallatitude'], c = 'r', s = 2)
-	plt.title('Rangemap')
-	
-	
-	#Rangemap SDM
-	ax2		=	fig1.add_subplot(gs[0,1])
-	plt.imshow(rangeSDM, cmap = 'viridis')
-	occs	=	trainingPoints[trainingPoints['presence'] == 1]
-	plt.scatter(occs['xpix'], occs['ypix'], s = 3, c = 'k')
-	plt.title('Rangemap based distribution')
-	
-	#Climate SDM
-	ax3		=	fig1.add_subplot(gs[1,0])
-	plt.imshow(climateSDM, cmap = 'viridis')
-	occs	=	trainingPoints[trainingPoints['presence'] == 1]
-	plt.scatter(occs['xpix'], occs['ypix'], s = 3, c = 'k')
-	plt.title('Climate SDM')
-	
-	
-	#Full SDM
-	ax4		=	fig1.add_subplot(gs[1,1])
-	plt.imshow(fullSDM, cmap = 'viridis')
-	occs	=	trainingPoints[trainingPoints['presence'] == 1]
-	plt.scatter(occs['xpix'], occs['ypix'], s = 3, c = 'k')
-	plt.title('Full SDM')
-	
-	#Maxent SDM
-	ax5	=	fig1.add_subplot(gs[0,2])
-	plt.imshow(maxentAverage, cmap = 'viridis')
-	occs	=	trainingPoints[trainingPoints['presence'] == 1]
-	plt.scatter(occs['xpix'], occs['ypix'], s = 3, c = 'k')
-	plt.title('Maxent results')
-	
-	
-	#Maxent SDM minus my SDM
-	ax6	=	fig1.add_subplot(gs[1,2])
-	bd	=	np.max((np.nanmin(maxentAverage-fullSDM) * -1), np.nanmax(maxentAverage-fullSDM))
-	plt.imshow(maxentAverage-fullSDM, cmap = 'bwr', vmin = bd * -1, vmax = bd)
-	occs	=	trainingPoints[trainingPoints['presence'] == 1]
-	plt.scatter(occs['xpix'], occs['ypix'], s = 3, c = 'k')
-	plt.title('Maxent results minus my climate')
-	
-	#Temp save and show
-	ts.tempSave(format = 'png')
-	plt.show()	
-	
-	
-	
-	
-	#Add graphs looking at quality of results
-	fig2 	= 	plt.figure()
-	gs 	=	GridSpec(2,2)
-	
-	#Logistic regression between my prediction of occurence and test points
-	ax1		=	fig2.add_subplot(gs[0,0])
-	sns.regplot(x = 'p', y = 'presence', data = testPoints, logistic = True)
-	plt.title('My SDM')
-	
-	
-	#Randomly test performance by comparing probability of presence to random values (my model)
-	ax2		=	fig2.add_subplot(gs[1,0])
-	
-	#Training Points
-	trainingPoints['randomValues'] 	=	np.random.uniform(0,1,len(trainingPoints))
-	trainingPoints['predicted']		=	0
-	trainingPoints['predicted'][trainingPoints['p'] >= trainingPoints['randomValues']] = 1
-	
-	#Test points
-	testPoints['randomValues'] 	=	np.random.uniform(0,1,len(testPoints))
-	testPoints['predicted']		=	0
-	testPoints['predicted'][testPoints['p'] >= testPoints['randomValues']] = 1
-	
-	#Make a chi-square type graph
-	chiBox	=	testPoints[['predicted', 'presence']]
-	chiBox['ones'] = 1
-	chiBox	=	chiBox.pivot_table(index = 'predicted', columns = 'presence', values = 'ones', aggfunc = np.sum)
-	sns.heatmap(chiBox, annot = True, fmt = 'd')
-	plt.title('My SDM')
-	ax6.set_xlabel('Observed Presence')
-	ax6.set_ylabel('Predicted Presence')
-	
-	#Logistic regression between Maxent prediction of occurence and test points
-	ax3		=	fig2.add_subplot(gs[0,1])
-	sns.regplot(x = 'p_maxent', y = 'presence', data = testPoints, logistic = True)
-	plt.title('Maxent')
-	
-	
-	#Randomly test performance by comparing probability of presence to random values (Maxent)
-	ax4		=	fig2.add_subplot(gs[1,1])
-	plt.title('Maxent')
-	
-	#Training Points
-	trainingPoints['randomValues'] 	=	np.random.uniform(0,1,len(trainingPoints))
-	trainingPoints['predicted_m']		=	0
-	trainingPoints['predicted_m'][trainingPoints['p_maxent'] >= trainingPoints['randomValues']] = 1
-	
-	#Test Points
-	testPoints['randomValues'] 	=	np.random.uniform(0,1,len(testPoints))
-	testPoints['predicted_m']		=	0
-	testPoints['predicted_m'][testPoints['p_maxent'] >= testPoints['randomValues']] = 1
-	
-	#Make chi-square graphic
-	chiBox	=	testPoints[['predicted_m', 'presence']]
-	chiBox['ones'] = 1
-	chiBox	=	chiBox.pivot_table(index = 'predicted_m', columns = 'presence', values = 'ones', aggfunc = np.sum)
-	sns.heatmap(chiBox, annot = True, fmt = 'd')
-	ax6.set_xlabel('Observed Presence')
-	ax6.set_ylabel('Predicted Presence')
-	
-	
-	#Temp save and show
-	ts.tempSave(format = 'png')
-	plt.show()
-	
-
-	
-	#Lets add traits and landcover!
-	speciesData		=	full[full['SciName_x'] == zookSpecies[i]].reset_index(drop = True)
-
-	niter	=	10000
-	burnin	=	5000
-	with pm.Model() as abundanceModel:
-		
-
-		
-		#Set up names
-		betaNames2	=	['c_beta0']
-		c_beta0		=	pm.Normal('c_beta0', np.mean(posterior['c_beta0']), np.std(posterior['c_beta0']))
-		
-		#Priors for linear and quadratic predictors
-		for j in range(len(predictors)):
 			
-			#Set variables names
-			name	=	list(predictors)[j]
-			l_name	=	str('l_' + name)
-			s_name	=	str('s_' + name)
-						
-			#Add names to list of predictors
-			betaNames2			=	betaNames2 + [l_name, s_name]
 			
-			#Set priors
-			globals()[l_name] 	= 	pm.Normal(l_name, np.mean(posterior[l_name]), np.std(posterior[l_name]))
-			globals()[s_name] 	= 	pm.Normal(s_name, np.mean(posterior[s_name]), np.std(posterior[s_name]))
+			
+			#Check for reverse hinge features
+			reverseFeatures	=	lambdas[lambdas['variable'].str.contains('`')]
+			lambdas.drop(reverseFeatures.index, inplace = True)
+			reverseFeatures	=	reverseFeatures.reset_index(drop = True)
+			
+			if len(reverseFeatures) >= 1:
+				for i in range(len(reverseFeatures)):
+					a		=	reverseFeatures['variable'][i].split('`')[1]
+					x		=	predictors[a]
+					
+					hinge	=	np.where(x < reverseFeatures['max'][i], (reverseFeatures['lambda'][i] *
+																		(reverseFeatures['max'][i] - x) /
+																		(reverseFeatures['max'][i] - reverseFeatures['min'][i])),
+																		0)
+					fx += hinge	
+					
+		
+			#Check for y 
+			forwardFeatures	=	lambdas[lambdas['variable'].str.contains("'")]
+			lambdas.drop(forwardFeatures.index, inplace = True)
+			forwardFeatures	=	forwardFeatures.reset_index(drop = True)
+			
+			if len(forwardFeatures) >= 1:
+				for i in range(len(forwardFeatures)):
+					a		=	forwardFeatures['variable'][i].split("'")[1]
+					x		=	predictors[a]
+					
+					
+					hinge	=	np.where(x >= forwardFeatures['min'][i],	(forwardFeatures['lambda'][i] *
+																		(x - forwardFeatures['min'][i]) /
+																		(forwardFeatures['max'][i] - forwardFeatures['min'][i])),
+																		0)
+					fx 	+= 	hinge
+			
 
-			
-		#Do multiplicative features
-		multiplicative	=	["qqq".join(map(str, comb)) for comb in combinations(list(predictors), 2)]
-		for j in range(len(multiplicative)):
-			
-			#Come up with names
-			name	=	multiplicative[j]
-			p_name	=	str('p_' + name)
-			
-			#Add names to list of predictors
-			betaNames2			=	betaNames2 + [p_name]
-			
-			#Set prior
-			globals()[p_name] 	= 	pm.Normal(p_name, np.mean(posterior[p_name]), np.std(posterior[p_name]))
+			#Check for multiplicative features
+			multiplicativeFeatures	=	lambdas[lambdas['variable'].str.contains('\*')]
+			lambdas.drop(multiplicativeFeatures.index, inplace = True)
+			multiplicativeFeatures	=	multiplicativeFeatures.reset_index(drop = True)
 
-		#Create the model
-		for j in range(len(betaNames2)):
-			variable		=	betaNames2[j]
-			form, feature	=	variable.split('_')
-			
-			#Process constants
-			if form == 'c':
-				logitpStr2	= str(variable)
-			
-			#Process linear features
-			if form == 'l':
-				logitpStr2	=	str(logitpStr2 + '+' + variable + '*' + 'speciesData["' + feature + '_150m"]')
-				
-			#Process quadratic features
-			elif form == 's':
-				logitpStr2	=	str(logitpStr2 + '+' + variable + '*' + 'speciesData["' + feature + '_150m"]**2')
-				
-			#Process product features
-			elif form == 'p':
-				feature1, feature2 = feature.split('qqq')
-				logitpStr2	=	str(logitpStr2 + '+' + variable + '*' + 'speciesData["' + feature1 + '_150m"]*speciesData["' + feature2 + '_150m"]')
-				
-		
-		
-		logitp2	=  eval(logitpStr2) 
-		
-		alphalam	=	pm.Normal("alphalam", 0, 1000)
-		FClam		=	pm.Normal('FClam', 0, 1000)
-	
-		
-		
-		logmu = alphalam + FClam * speciesData['EVI_1984_150m']
-		
-		
-	
-		y = pm.ZeroInflatedPoisson("obsv", theta=tt.exp(logmu), psi=tinvlogit(logitp2), observed=speciesData['Count'])
-		lam = pm.Deterministic("lam", tt.exp(logmu))
-		p = pm.Deterministic("p", tinvlogit(logitp2))
+			#Calculate contribution of multiplicative features
+			if len(multiplicativeFeatures) >= 1:
+				for i in range(len(multiplicativeFeatures)):
+					a, b 	=	multiplicativeFeatures['variable'][i].split('*')
+					x1		=	predictors[a]
+					x2		=	predictors[b]
 
-		
-		trace	=	pm.sample(niter)
+					fx		+=	(	multiplicativeFeatures['lambda'][i] *
+									(x1 * x2 - multiplicativeFeatures['min'][i]) /
+									(multiplicativeFeatures['max'][i] - multiplicativeFeatures['min'][i]))
 
-		betaNames2	=	betaNames2
-	
-		#Set up a DF to hold your posteriors
-		posterior2	=	pd.DataFrame(index = np.arange(niter-burnin))
-			
-		#Get your posteriors out
-		for j in range(len(betaNames2)):
-			name	=	betaNames2[j]
-			posterior2[name]	=	trace.get_values(str(name), burn=burnin)
-		add	=	['alphalam', 'FClam']
-		for j in range(len(add)):
-			name	=	add[j]
-			posterior2[name]	=	trace.get_values(str(name), burn=burnin)
-	
-	#Look at your trace plots
-	fig3a 	= 	plt.figure()
-	numSubplots	=	len(list(posterior2))
-	columns		=	int(math.ceil(numSubplots**0.5))
-	rows			=	int(math.ceil(numSubplots/columns))
-	if rows * columns != numSubplots:
-		rows += 1
-	gs			=	GridSpec(columns, rows)
-	
-	x = 0
-	y = 0
-	
-	for j in range(numSubplots):
-		ax	=	fig3a.add_subplot(gs[x,y])
-		plt.plot(posterior2[[j]])
-		plt.title(list(posterior2)[j])
-		x += 1
-		if x == columns:
-			x = 0
-			y += 1
-	ts.tempSave(format = 'png')
-	plt.show()
-		
-	fig3b 	= 	plt.figure()
-	x = 0
-	y = 0
-	
-	for j in range(numSubplots):
-		ax	=	fig3b.add_subplot(gs[x,y])
-		sns.distplot(posterior2[[j]])
-		plt.title(list(posterior2)[j])
-		x += 1
-		if x == columns:
-			x = 0
-			y += 1
-	ts.tempSave(format = 'png')
-	plt.show()
-	
-	
-	#Loop through features
-	p_prediction = 0
-	for j in range(len(betaNames2)):
-		variable		=	betaNames2[j]
-		form, feature	=	variable.split('_')
-		
-		
-		#Process constants
-		if form == 'c':
-			feature			=	str(feature + '_150m')
-			p_prediction	=	p_prediction + np.mean(posterior2[variable])
-		
-		#Process linear features
-		if form == 'l':
-			feature			=	str(feature + '_150m')
-			p_prediction	=	p_prediction + np.mean(posterior2[variable]) * speciesData[feature]
-			
-		#Proces quadratic features
-		elif form == 's':
-			feature			=	str(feature + '_150m')
-			p_prediction	=	p_prediction + np.mean(posterior2[variable]) * speciesData[feature] ** 2
-			
-		#Process product features
-		elif form == 'p':
-			feature1, feature2	=	feature.split('qqq')
-			feature1			=	str(feature1 + '_150m')
-			feature2			=	str(feature2 + '_150m')
-			p_prediction	=	p_prediction + np.mean(posterior2[variable]) * speciesData[feature1] * speciesData[feature2]
-			
-		p_prediction 	= 	np.exp(p_prediction) / (1 + np.exp(p_prediction))
-		logmu 			= 	np.mean(posterior2['alphalam']) + np.mean(posterior2['FClam']) * speciesData['EVI_1984_150m']
+			#Check for squared features
+			squareFeatures	=	lambdas[lambdas['variable'].str.contains('\^')]
+			lambdas.drop(squareFeatures.index, inplace = True)
+			squareFeatures	=	squareFeatures.reset_index(drop = True)
 
-		a			=	np.exp(logmu) * p_prediction 
-		plt.scatter(speciesData['EVI_1984_150m'], a);plt.show()
-		
-		
-		
-		
-		
-		
-		
-		
+			#Calculate contribution of squared features
+			if len(squareFeatures) >= 1:
+				for i in range(len(squareFeatures)):
+					a		=	squareFeatures['variable'][i].split('^')[0]
+					x		=	predictors[a]
+
+					fx		+=	(	squareFeatures['lambda'][i] *	
+									(x * x - squareFeatures['min'][i]) / 
+									(squareFeatures['max'][i] - squareFeatures['min'][i]))
+					
+			#Finally do linear features
+			lambdas	=	lambdas.reset_index(drop = True)
+			if len(lambdas) >= 1:
+				for i in range(len(lambdas)):
+					a		=	lambdas['variable'][i]
+					x		=	predictors[a]
+
+					fx		+=	(	lambdas['lambda'][i] *	
+									(x - lambdas['min'][i]) / 
+									(lambdas['max'][i] - lambdas['min'][i]))
+					
+			s	=	fx - linearPredictorNormalizer
+			qx	=	np.exp(s) / densityNormalizer
+			ls	=	(qx * np.exp(entropy) / (1 + qx * np.exp(entropy)))
+			
+			replicatedRuns[k,:,:]	=	np.copy(ls)
+			
+	return replicatedRuns
+
